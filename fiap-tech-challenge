@@ -1,0 +1,184 @@
+import cv2
+import mediapipe as mp
+import face_recognition
+from deepface import DeepFace
+import math
+from docx import Document
+from tqdm import tqdm
+
+# Inicializando MediaPipe Holistic para detecçao de movimentos
+mp_holistic = mp.solutions.holistic
+holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+# Funçao para calcular a distância entre dois pontos 3D
+def calculate_distance_3d(p1, p2):
+    return math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2 + (p1.z - p2.z) ** 2)
+
+# Funçao para calcular a distância entre dois pontos 2D
+def calculate_distance_2d(p1, p2):
+    return math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2)
+
+# Funçao para detectar movimentos Anomalos
+def is_anomalous_movement(current_landmarks, previous_landmarks, threshold=0.18):
+    if not previous_landmarks:
+        return False
+
+    # Calcula o movimento médio entre os pontos
+    movement = sum(
+        calculate_distance_3d(current, previous)
+        for current, previous in zip(current_landmarks, previous_landmarks)
+    ) / len(current_landmarks)
+
+    return movement > threshold
+
+# Funçao para detectar aperto de Mao
+def detect_handshake(landmarks, threshold=0.05):
+    if not landmarks or len(landmarks) < 2:
+        return False
+
+    for i in range(len(landmarks) - 1):
+        for j in range(i + 1, len(landmarks)):
+            left_hand_i = landmarks[i].landmark[mp_holistic.HandLandmark.WRIST]
+            left_hand_j = landmarks[j].landmark[mp_holistic.HandLandmark.WRIST]
+
+            distance = calculate_distance_2d(left_hand_i, left_hand_j)
+
+            if distance < threshold:
+                return True
+    return False
+
+# Configuraçao do vídeo
+video_path = "Unlocking Facial Recognition_ Diverse Activities Analysis.mp4"
+cap = cv2.VideoCapture(video_path)
+frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+processed_frames = 0
+anomalous_movements = 0
+handshakes_detected = 0
+previous_landmarks = None
+previous_anomalous = False  # Indica se o frame anterior foi Anomalo
+previous_artifacts = []  # Armazena artefatos do último frame processado
+
+# Configurando saída de vídeo
+output_path = "processed_video.mp4"
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+# Documento Word para o resumo
+doc = Document()
+doc.add_heading('Resumo da Análise do Vídeo', level=1)
+
+# Barra de progresso com tqdm
+frame_interval = 10
+frame_index = 0
+
+# Inicializa tqdm para a barra de progresso
+with tqdm(total=frame_count // frame_interval, desc="Processando vídeo") as pbar:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        handshake_detected = False
+
+        if frame_index % frame_interval == 0:
+            processed_frames += 1
+
+            # Processando o frame com MediaPipe Holistic
+            results = holistic.process(rgb_frame)
+
+            if results.pose_landmarks:
+                # Obtém os pontos do corpo
+                current_landmarks = results.pose_landmarks.landmark
+
+                # Detectando movimento Anomalo
+                anomalous = is_anomalous_movement(current_landmarks, previous_landmarks)
+                if anomalous and not previous_anomalous:
+                    anomalous_movements += 1
+                previous_landmarks = current_landmarks
+                previous_anomalous = anomalous
+
+            # Detectando rostos com face_recognition
+            face_locations = face_recognition.face_locations(rgb_frame, model="cnn")
+
+            previous_artifacts = []
+            for i, (top, right, bottom, left) in enumerate(face_locations):
+                # Ajuste do recorte
+                padding = 10
+                top = max(0, top - padding)
+                bottom = min(frame_height, bottom + padding)
+                left = max(0, left - padding)
+                right = min(frame_width, right + padding)
+
+                # Detectando Emocao com DeepFace
+                try:
+                    face_crop = frame[top:bottom, left:right]
+                    if face_crop.size > 0:
+                        analysis = DeepFace.analyze(face_crop, actions=['emotion'], enforce_detection=False)
+                        emotion = emotion = analysis[0]['dominant_emotion']
+                    else:
+                        emotion = "Indefinido"
+                except Exception:
+                    emotion = "Indefinido"
+
+                # Armazenando os artefatos do frame processado
+                previous_artifacts.append({
+                    "bbox": (left, top, right, bottom),
+                    "emotion": emotion,
+                    "anomalous": anomalous
+                })
+
+                # Adicionando informaçoes ao documento
+                doc.add_paragraph(
+                    f"Frame {processed_frames}: Rosto {i+1} - Emocao: {emotion}, "
+                    f"Movimento Anomalo: {'Sim' if anomalous else 'Nao'}"
+                )
+
+            # Detectar aperto de Mao
+            if results.left_hand_landmarks and results.right_hand_landmarks:
+                handshake_detected = detect_handshake(
+                    [results.left_hand_landmarks, results.right_hand_landmarks]
+                )
+                if handshake_detected:
+                    handshakes_detected += 1
+                    doc.add_paragraph(f"Frame {processed_frames}: Aperto de Mao detectado.")
+
+            # Atualiza a barra de progresso
+            pbar.update(1)
+
+        # Aplicando os artefatos no frame atual
+        for artifact in previous_artifacts:
+            left, top, right, bottom = artifact["bbox"]
+            emotion = artifact["emotion"]
+            anomalous = artifact["anomalous"]
+
+            # Desenhando os retângulos e texto no frame
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(frame, f"Emocao: {emotion}", (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(frame, f"Mov. Anomalo: {'Sim' if anomalous else 'Nao'}",
+                        (left, bottom + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        if handshake_detected:
+            cv2.putText(frame, "Aperto de Mao Detectado", (50, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+        # Escrevendo frame no vídeo de saída
+        out.write(frame)
+        frame_index += 1
+
+# Salvando o resumo
+doc.add_heading('Resumo Final', level=2)
+doc.add_paragraph(f"Total de Frames: {frame_count}")
+doc.add_paragraph(f"Frames Processados: {processed_frames}")
+doc.add_paragraph(f"Movimentos Anomalos Detectados: {anomalous_movements}")
+doc.add_paragraph(f"Apertos de Mao Detectados: {handshakes_detected}")
+doc.save("video_analysis_summary.docx")
+
+# Finalizando
+cap.release()
+out.release()
+cv2.destroyAllWindows()
